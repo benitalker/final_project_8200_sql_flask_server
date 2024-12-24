@@ -1,5 +1,6 @@
 import io
 import json
+from math import isnan
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
@@ -7,12 +8,48 @@ import folium
 from folium import plugins
 import seaborn as sns
 from app.repository.psql_repository import get_locations_for_common_attacks
+from toolz import pipe, curry
+from typing import List, Tuple
 
 def create_map(center=None, zoom=2):
     if center is None:
         center = [0, 0]
     return folium.Map(
         location=center,
+        zoom_start=zoom,
+        tiles='CartoDB positron'
+    )
+@curry
+def validate_coordinates(lat: float, lon: float) -> bool:
+    return (isinstance(lat, (int, float)) and
+            isinstance(lon, (int, float)) and
+            not (np.isnan(lat) or np.isnan(lon)) and
+            -90 <= lat <= 90 and
+            -180 <= lon <= 180 and
+            lat != 0 and lon != 0)
+@curry
+def filter_valid_results(results: List[Tuple]) -> List[Tuple]:
+    return [
+        (region, count, score, lat, lon)
+        for region, count, score, lat, lon in results
+        if validate_coordinates(lat, lon)
+    ]
+@curry
+def create_circle_marker(m: folium.Map, region: str, count: int,
+                        score: float, lat: float, lon: float) -> folium.Map:
+    avg_casualties = score / count if count > 0 else 0
+    folium.Circle(
+        location=[lat, lon],
+        radius=avg_casualties * 100000,
+        color='red',
+        fill=True,
+        popup=f"{region}<br>Avg Casualties: {avg_casualties:.2f}<br>Total Events: {count}"
+    ).add_to(m)
+    return m
+def create_base_map(center: List[float] = None, zoom: int = 2) -> folium.Map:
+    """Create a base Folium map with consistent settings."""
+    return folium.Map(
+        location=center or [0, 0],
         zoom_start=zoom,
         tiles='CartoDB positron'
     )
@@ -32,21 +69,20 @@ def deadliest_attacks_service(results):
     plt.close()
     return buf
 # 2
-def casualties_by_region_service(results):
-    m = create_map()
-    for region, count, score, lat, lon in results:
-        if lat and lon:
-            avg_casualties = score / count if count > 0 else 0
-            folium.Circle(
-                location=[lat, lon],
-                radius=avg_casualties * 100,
-                color='red',
-                fill=True,
-                popup=f"{region}<br>Avg Casualties: {avg_casualties:.2f}<br>Total Events: {count}"
-            ).add_to(m)
+def casualties_by_region_service(results: List[Tuple]) -> io.BytesIO:
     buf = io.BytesIO()
-    m.save(buf, close_file=False)
+    pipe(
+        results,
+        filter_valid_results,
+        lambda data: create_base_map(),
+        lambda m: add_all_markers(m, filter_valid_results(results)),
+        lambda m: m.save(buf, close_file=False)
+    )
     return buf
+def add_all_markers(m: folium.Map, data: List[Tuple]) -> folium.Map:
+    for result in data:
+        m = create_circle_marker(m, *result)
+    return m
 # 3
 def top_casualty_groups_service(results):
     plt.figure(figsize=(10, 6))
@@ -121,43 +157,107 @@ def attack_change_by_region_service(df,top_n):
     plt.close()
     return buf
 # 7
-def terror_heatmap_service(locations,current_year,time_period,region_filter):
+def terror_heatmap_service(locations, current_year, time_period, region_filter):
     m = create_map()
+
+    # Debug: Print incoming data
+    print(f"Received {len(locations)} locations for processing")
+
+    def is_valid_coord(lat, lon):
+        try:
+            lat, lon = float(lat), float(lon)
+            return (not isnan(lat) and not isnan(lon) and
+                    -90 <= lat <= 90 and -180 <= lon <= 180 and
+                    lat != 0 and lon != 0)  # Exclude 0,0 coordinates
+        except (ValueError, TypeError):
+            return False
 
     if time_period in ['3_years', '5_years']:
         years_data = {}
-        for year in range(current_year - (3 if time_period == '3_years' else 5), current_year + 1):
+        years_range = range(current_year - (3 if time_period == '3_years' else 5), current_year + 1)
+
+        for year in years_range:
             year_locations = [
-                [loc.latitude, loc.longitude]
-                for loc in locations if loc.year == year
+                [float(loc.latitude), float(loc.longitude), float(loc.event_count)]
+                for loc in locations
+                if loc.year == year and is_valid_coord(loc.latitude, loc.longitude)
             ]
             if year_locations:
                 years_data[year] = year_locations
+                print(f"Year {year}: Found {len(year_locations)} valid locations")
 
         if years_data:
-            plugins.HeatMapWithTime(
-                [list(years_data.values())],
-                index=list(years_data.keys()),
-                auto_play=True,
-                max_opacity=0.8
-            ).add_to(m)
-    else:
-        heat_data = [[loc.latitude, loc.longitude] for loc in locations]
-        plugins.HeatMap(heat_data,
+            try:
+                plugins.HeatMapWithTime(
+                    list(years_data.values()),
+                    index=list(years_data.keys()),
+                    auto_play=True,
+                    max_opacity=0.8,
+                    radius=15
+                ).add_to(m)
+                print("Successfully added HeatMapWithTime")
+            except Exception as e:
+                print(f"Error creating time heatmap: {str(e)}")
+                # Fallback to regular heatmap
+                all_heat_data = [
+                    [float(loc.latitude), float(loc.longitude), float(loc.event_count)]
+                    for loc in locations
+                    if is_valid_coord(loc.latitude, loc.longitude)
+                ]
+                if all_heat_data:
+                    plugins.HeatMap(
+                        all_heat_data,
                         name='Terror Hotspots',
-                        max_opacity=0.8
-                        ).add_to(m)
+                        max_opacity=0.8,
+                        radius=15
+                    ).add_to(m)
+                    print("Added fallback HeatMap")
+    else:
+        heat_data = [
+            [float(loc.latitude), float(loc.longitude), float(loc.event_count)]
+            for loc in locations
+            if is_valid_coord(loc.latitude, loc.longitude)
+        ]
+        print(f"Regular heatmap: Found {len(heat_data)} valid locations")
 
+        if heat_data:
+            plugins.HeatMap(
+                heat_data,
+                name='Terror Hotspots',
+                max_opacity=0.8,
+                radius=15
+            ).add_to(m)
+            print("Added regular HeatMap")
+
+    # Add layer control
     folium.LayerControl().add_to(m)
+
+    # Calculate stats
+    total_events = sum(loc.event_count for loc in locations)
+    valid_locations = len([loc for loc in locations if is_valid_coord(loc.latitude, loc.longitude)])
+
     stats_html = f"""
-        <div style='width: 300px; background: white; padding: 10px;'>
-        <h4>Terror Hotspots Analysis</h4>
-        <p>Total Events: {len(locations)}</p>
-        <p>Time Period: {time_period}</p>
-        {'<p>Region: ' + region_filter + '</p>' if region_filter else ''}
+        <div style='position: fixed; 
+                    bottom: 50px; 
+                    left: 50px; 
+                    z-index: 1000;
+                    background-color: white;
+                    padding: 10px;
+                    border: 2px solid #ccc;
+                    border-radius: 5px;'>
+            <h4>Terror Hotspots Analysis</h4>
+            <p><b>Total Events:</b> {total_events}</p>
+            <p><b>Unique Locations:</b> {valid_locations}</p>
+            <p><b>Time Period:</b> {time_period.replace('_', ' ').title()}</p>
+            {'<p><b>Region:</b> ' + region_filter + '</p>' if region_filter else ''}
+            <p style='font-size: 0.8em; color: #666;'>
+                Heatmap intensity indicates number of events
+            </p>
         </div>
-        """
+    """
+
     m.get_root().html.add_child(folium.Element(stats_html))
+
     buf = io.BytesIO()
     m.save(buf, close_file=False)
     return buf
@@ -165,46 +265,50 @@ def terror_heatmap_service(locations,current_year,time_period,region_filter):
 def active_groups_heatmap_service(results, region_filter):
     m = create_map()
 
-    for result in results:
-        if len(result) == 5:
-            group, region, count, lat, lon = result
-            popup_text = f"""
-                <b>{group}</b><br>
-                Region: {region}<br>
-                Attacks: {count}
-            """
+    regions_data = {}
+    for r in results:
+        if isinstance(r, dict):
+            region = r['region_name']
+            coords = {'lat': r['avg_lat'], 'lon': r['avg_lon']}
+            group_data = {'name': r['group_name'], 'count': r['attack_count']}
         else:
-            group, count, lat, lon = result
-            popup_text = f"""
-                <b>{group}</b><br>
-                Attacks: {count}<br>
-                {'Region: ' + region_filter if region_filter else ''}
+            region = region_filter
+            coords = {'lat': r.avg_lat, 'lon': r.avg_lon}
+            group_data = {'name': r.group_name, 'count': r.attack_count}
+
+        if region not in regions_data:
+            regions_data[region] = {
+                'coords': coords,
+                'groups': []
+            }
+        regions_data[region]['groups'].append(group_data)
+
+    for region, data in regions_data.items():
+        if data['coords']['lat'] and data['coords']['lon']:
+            popup_content = f"""
+                <div style='min-width: 250px'>
+                    <h4>Active Groups in {region}</h4>
+                    <table style='width:100%'>
+                        <tr><th>Group</th><th>Attacks</th></tr>
+                        {''.join(f"<tr><td>{g['name']}</td><td>{g['count']}</td></tr>"
+                                 for g in data['groups'])}
+                    </table>
+                </div>
             """
 
-        if lat and lon:
-            marker = folium.Marker(
-                location=[lat, lon],
-                popup=popup_text,
-                tooltip=group,
+            folium.Marker(
+                location=[data['coords']['lat'], data['coords']['lon']],
+                popup=folium.Popup(popup_content, max_width=300),
+                tooltip=f"Top groups in {region}",
                 icon=folium.Icon(color='red', icon='info-sign')
-            )
-            marker.add_to(m)
+            ).add_to(m)
 
-    summary_html = f"""
-    <div style='position: fixed; 
-                bottom: 50px; 
-                left: 50px; 
-                z-index: 1000;
-                background-color: white;
-                padding: 10px;
-                border: 2px solid #ccc;
-                border-radius: 5px;'>
-        <h4>Active Groups Analysis</h4>
-        <p>Showing top 5 most active groups{' in ' + region_filter if region_filter else ' per region'}</p>
-        <p>Total groups shown: {len(results)}</p>
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(summary_html))
+    summary = f"<div style='position:fixed;bottom:50px;left:50px;background:white;padding:10px;border:2px solid #ccc;border-radius:5px;z-index:1000'>"
+    summary += f"<h4>Active Groups Analysis</h4>"
+    summary += f"<p>Showing top 5 active groups {'in ' + region_filter if region_filter else 'per region'}</p>"
+    summary += "</div>"
+
+    m.get_root().html.add_child(folium.Element(summary))
 
     buf = io.BytesIO()
     m.save(buf, close_file=False)
@@ -487,7 +591,7 @@ def common_attack_strategies_service(results):
         if key not in location_data:
             location_data[key] = {
                 'attack_types': {},
-                'location': result['region'] + ', ' + result['country']
+                'location': result['region'] + (f", {result['country']}" if result['country'] else '')
             }
         attack_type = result['attack_type']
         location_data[key]['attack_types'][attack_type] = {
@@ -495,11 +599,25 @@ def common_attack_strategies_service(results):
             'total_attacks': result['total_attacks'],
             'groups': result['groups']
         }
+    valid_locations = 0
+    skipped_locations = []
     for (region, country), data in location_data.items():
-        main_attack_type = max(data['attack_types'].items(),
-                               key=lambda x: (x[1]['num_groups'], x[1]['total_attacks']))
-        location = get_locations_for_common_attacks(region,country)
-        if location and location.lat and location.lon:
+        location = get_locations_for_common_attacks(region, country)
+        valid_coords = (
+                location and
+                location.latitude is not None and
+                location.longitude is not None and
+                isinstance(location.latitude, (int, float)) and
+                isinstance(location.longitude, (int, float)) and
+                not isnan(location.latitude) and
+                not isnan(location.longitude)
+        )
+        if valid_coords:
+            valid_locations += 1
+            main_attack_type = max(
+                data['attack_types'].items(),
+                key=lambda x: (x[1]['num_groups'], x[1]['total_attacks'])
+            )
             popup_content = f"""
                 <div style='min-width: 300px'>
                     <h4>{data['location']}</h4>
@@ -515,27 +633,39 @@ def common_attack_strategies_service(results):
                     <p><b>Other Common Strategies:</b></p>
                     <ul>
             """
+
             other_attacks = sorted(
                 data['attack_types'].items(),
                 key=lambda x: (x[1]['num_groups'], x[1]['total_attacks']),
                 reverse=True
             )[1:4]
+
             for attack_type, attack_data in other_attacks:
                 popup_content += f"""
                     <li>{attack_type} 
                         ({attack_data['num_groups']} groups, 
                         {attack_data['total_attacks']} attacks)</li>
                 """
+
             popup_content += "</ul></div>"
+
             radius = min(20, main_attack_type[1]['num_groups'] * 3)
-            folium.CircleMarker(
-                location=[location.lat, location.lon],
-                radius=radius,
-                color='red',
-                fill=True,
-                popup=folium.Popup(popup_content, max_width=400),
-                tooltip=f"{data['location']}: {main_attack_type[1]['num_groups']} groups using {main_attack_type[0]}"
-            ).add_to(m)
+
+            try:
+                folium.CircleMarker(
+                    location=[float(location.latitude), float(location.longitude)],
+                    radius=radius,
+                    color='red',
+                    fill=True,
+                    popup=folium.Popup(popup_content, max_width=400),
+                    tooltip=f"{data['location']}: {main_attack_type[1]['num_groups']} groups using {main_attack_type[0]}"
+                ).add_to(m)
+            except (ValueError, TypeError) as e:
+                print(f"Error creating marker for {data['location']}: {str(e)}")
+                skipped_locations.append(f"{data['location']} (invalid coordinates)")
+        else:
+            skipped_locations.append(data['location'])
+
     summary_html = f"""
     <div style='position: fixed; 
                 bottom: 50px; 
@@ -546,12 +676,22 @@ def common_attack_strategies_service(results):
                 border: 2px solid #ccc;
                 border-radius: 5px;'>
         <h4>Common Attack Strategies Analysis</h4>
-        <p>Total Locations: {len(location_data)}</p>
+        <p>Displayed Locations: {valid_locations} / {len(location_data)}</p>
         <p>🔴 Marker size indicates number of groups</p>
         <p>Click markers for detailed information</p>
     </div>
     """
+
+    if skipped_locations:
+        summary_html = summary_html.replace('</div>', f"""
+        <p style='font-size: 0.8em; color: #666;'>
+            Unable to map {len(skipped_locations)} location(s)
+        </p>
+        </div>
+        """)
+
     m.get_root().html.add_child(folium.Element(summary_html))
+
     buf = io.BytesIO()
     m.save(buf, close_file=False)
     return buf
